@@ -181,8 +181,8 @@ def flash_attention_kernel(
     num_heads: tl.constexpr,
     num_kv_heads: tl.constexpr,
     head_dim: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
+    BLOCK_M: tl.constexpr, # q block 大小
+    BLOCK_N: tl.constexpr, # k/v block 大小
 ):
     """Flash Attention - O(N) memory via online softmax"""
     start_m = tl.program_id(0)

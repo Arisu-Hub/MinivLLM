@@ -10,6 +10,7 @@ from myvllm.models.qwen3 import Qwen3ForCausalLM
 from myvllm.models.llama import LlamaForCausalLM
 from myvllm.layers.sampler import SamplerLayer
 from myvllm.engine.sequence import Sequence
+from myvllm.quantization.kv_cache_quant import block_bytes as kv_block_bytes, resolve_cache_torch_dtype
 from myvllm.utils import *
 
 class ModelRunner:
@@ -208,10 +209,18 @@ class ModelRunner:
         num_kv_heads = self.config['num_kv_heads'] // self.world_size
         head_dim = self.config['head_dim'] if 'head_dim' in self.config else self.config['hidden_size'] // self.config['num_heads']
 
-        # check whether the current free memory can hold at least one block
-        # compute the actual byte required of each block
-        block_bytes = self.block_size * 2 * num_layers * num_kv_heads * head_dim * self.default_dtype.itemsize
-        num_available_kv_blocks = int(available_mem // block_bytes)
+        kv_cache_dtype = self.config.get("kv_cache_dtype", "fp16")
+        cache_dtype = resolve_cache_torch_dtype(kv_cache_dtype, self.default_dtype)
+
+        # Each block includes K/V data plus fp32 scales (scale=1.0 for non-int8 modes).
+        per_block_bytes = kv_block_bytes(
+            self.block_size,
+            num_layers,
+            num_kv_heads,
+            head_dim,
+            kv_cache_dtype,
+        )
+        num_available_kv_blocks = int(available_mem // per_block_bytes)
         assert num_available_kv_blocks >= 1, f'Not enough memory to hold at least one block of KV cache on rank {self.rank}'
         
         # Synchronize max_cached_blocks across all ranks.
@@ -241,15 +250,38 @@ class ModelRunner:
         if self.rank == 0:
             print(f"[Rank 0] Global max_cached_blocks (min): {self.config['max_cached_blocks']}")
 
-        # allocate max possible kv cache for the model, instead for each sequence
-        # this is the key for paged attention: one giant KV cache pool, divided into blocks
-        # IMPORTANT: Use zeros() instead of empty() to avoid garbage values
-        allocated_kv_cache = torch.zeros(2, self.config['num_layers'], self.config['max_cached_blocks'], self.block_size, num_kv_heads, head_dim, device=f'cuda:{self.rank}')
+        max_cached_blocks = self.config['max_cached_blocks']
+
+        # K/V cache pool: dtype depends on kv_cache_dtype (fp16 or int8).
+        allocated_kv_cache = torch.zeros(
+            2,
+            num_layers,
+            max_cached_blocks,
+            self.block_size,
+            num_kv_heads,
+            head_dim,
+            dtype=cache_dtype,
+            device=f'cuda:{self.rank}',
+        )
+        # Scale pool: always fp32, init to 1.0 (identity dequant for fp16).
+        allocated_k_scales = torch.ones(
+            num_layers,
+            max_cached_blocks,
+            self.block_size,
+            num_kv_heads,
+            dtype=torch.float32,
+            device=f'cuda:{self.rank}',
+        )
+        allocated_v_scales = torch.ones_like(allocated_k_scales)
+
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, 'k_cache') and hasattr(module, 'v_cache'):
                 module.k_cache = allocated_kv_cache[0, layer_id]
                 module.v_cache = allocated_kv_cache[1, layer_id]
+                module.k_scale = allocated_k_scales[layer_id]
+                module.v_scale = allocated_v_scales[layer_id]
+                module.kv_cache_dtype = kv_cache_dtype
                 layer_id += 1
 
     # given seqs

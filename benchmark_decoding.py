@@ -67,13 +67,13 @@ def paged_attention_decode_kernel(
             
             qk = tl.where(mask_n, qk, -1e10)
             
-            m_ij = tl.max(qk)
-            m_i_new = tl.maximum(m_i, m_ij)
-            alpha = tl.exp(m_i - m_i_new)
-            p = tl.exp(qk - m_i_new)
+            m_ij = tl.max(qk)   # 求当前块内部最大值
+            m_i_new = tl.maximum(m_i, m_ij) # 更新整行新的全局最大值
+            alpha = tl.exp(m_i - m_i_new) # 缩放系数 e^{m_i​−m_{new}}​
+            p = tl.exp(qk - m_i_new) # 当前块未归一化的 Softmax 权重
             
-            acc = acc * alpha
-            l_i = l_i * alpha
+            acc = acc * alpha # Attention 输出累加值
+            l_i = l_i * alpha # 当前 Query 行已遍历元素的指数和
             
             for i in range(BLOCK_N):
                 token_idx = token_start + i
@@ -259,8 +259,8 @@ def naive_decode_attention(
     # This is the inefficient part - materializes full attention matrix
     attn_scores = torch.matmul(q, padded_k.transpose(-2, -1)) * scale
     
-    mask = torch.arange(max_context_len, device=device)[None, :] < context_lens[:, None]
-    mask = mask[:, None, None, :]
+    mask = torch.arange(max_context_len, device=device)[None, :] < context_lens[:, None]  # 扩充张量的维度 广播
+    mask = mask[:, None, None, :] # (B, 1, 1, N)
     attn_scores = attn_scores.masked_fill(~mask, float('-inf'))
     
     attn_probs = torch.softmax(attn_scores, dim=-1)

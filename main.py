@@ -60,6 +60,7 @@ def main():
             [{"role": "user", "content": prompt}],
             tokenize=False,
             add_generation_prompt=True,
+            enable_thinking=False,  # 关闭思考模式
         )
         for prompt in prompts
     ]

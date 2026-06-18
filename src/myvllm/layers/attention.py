@@ -1,6 +1,7 @@
 import triton 
 import triton.language as tl
 from myvllm.utils import get_context
+from myvllm.quantization.kv_cache_quant import quantize_kv_vector
 import torch
 import torch.nn as nn
 
@@ -64,13 +65,71 @@ def store_kvcache_kernel(
     tl.store(v_cache_ptr + cache_offset, value)
 
 
+@triton.jit
+def store_kvcache_with_scale_kernel(
+    key_ptr,
+    value_ptr,
+    key_scale_ptr,
+    value_scale_ptr,
+    k_cache_ptr,
+    v_cache_ptr,
+    k_scale_cache_ptr,
+    v_scale_cache_ptr,
+    slot_mapping_ptr,
+    num_kv_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    block_size: tl.constexpr,
+):
+    """Store INT8 K/V and per-head scales into paged KV cache."""
+    token_idx = tl.program_id(0)
+    slot_idx = tl.load(slot_mapping_ptr + token_idx)
+
+    if slot_idx == -1:
+        return
+
+    block_idx = slot_idx // block_size
+    block_offset = slot_idx % block_size
+    head_idx = tl.program_id(1)
+
+    head_offsets = tl.arange(0, head_dim)
+    input_offset = (
+        token_idx * num_kv_heads * head_dim
+        + head_idx * head_dim
+        + head_offsets
+    )
+    cache_offset = (
+        block_idx * block_size * num_kv_heads * head_dim
+        + block_offset * num_kv_heads * head_dim
+        + head_idx * head_dim
+        + head_offsets
+    )
+    scale_cache_offset = (
+        block_idx * block_size * num_kv_heads
+        + block_offset * num_kv_heads
+        + head_idx
+    )
+
+    key = tl.load(key_ptr + input_offset)
+    value = tl.load(value_ptr + input_offset)
+    tl.store(k_cache_ptr + cache_offset, key)
+    tl.store(v_cache_ptr + cache_offset, value)
+
+    key_scale = tl.load(key_scale_ptr + token_idx * num_kv_heads + head_idx)
+    value_scale = tl.load(value_scale_ptr + token_idx * num_kv_heads + head_idx)
+    tl.store(k_scale_cache_ptr + scale_cache_offset, key_scale)
+    tl.store(v_scale_cache_ptr + scale_cache_offset, value_scale)
+
+
 def store_kvcache(
-    key: torch.Tensor, 
-    value: torch.Tensor, 
-    k_cache: torch.Tensor, 
-    v_cache: torch.Tensor, 
+    key: torch.Tensor,
+    value: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
-    block_size: int
+    block_size: int,
+    k_scale_cache: torch.Tensor | None = None,
+    v_scale_cache: torch.Tensor | None = None,
+    kv_cache_dtype: str = "fp16",
 ):
     """
     Store key-value pairs into paged cache.
@@ -82,29 +141,53 @@ def store_kvcache(
         v_cache: (num_blocks, block_size, num_kv_heads, head_dim)
         slot_mapping: (num_tokens,) - maps each token to a cache slot
         block_size: number of tokens per block
+        k_scale_cache: (num_blocks, block_size, num_kv_heads), fp32
+        v_scale_cache: same as k_scale_cache
+        kv_cache_dtype: "fp16" stores fp16 directly; "int8" quantizes on store
     """
     num_tokens, num_kv_heads, head_dim = key.shape
-    
-    # Make contiguous if needed
+
     if not key.is_contiguous():
         key = key.contiguous()
     if not value.is_contiguous():
         value = value.contiguous()
-    
+
     assert k_cache.shape == v_cache.shape, "K and V cache shapes must match"
     assert slot_mapping.numel() == num_tokens, "Slot mapping size must match number of tokens"
-    
+
     grid = (num_tokens, num_kv_heads)
-    # launch num_tokens x num_kv_heads threads
+
+    if kv_cache_dtype == "int8":
+        assert k_scale_cache is not None and v_scale_cache is not None
+        k_int8, k_sc = quantize_kv_vector(key)
+        v_int8, v_sc = quantize_kv_vector(value)
+        k_sc = k_sc.contiguous()
+        v_sc = v_sc.contiguous()
+        store_kvcache_with_scale_kernel[grid](
+            k_int8,
+            v_int8,
+            k_sc,
+            v_sc,
+            k_cache,
+            v_cache,
+            k_scale_cache,
+            v_scale_cache,
+            slot_mapping,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            block_size=block_size,
+        )
+        return
+
     store_kvcache_kernel[grid](
-        key, # tensors are automatically converted to pointers by triton
+        key,
         value,
         k_cache,
         v_cache,
         slot_mapping,
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
-        block_size=block_size
+        block_size=block_size,
     )
 
 
@@ -286,6 +369,8 @@ def paged_attention_decode_kernel(
     query_ptr,
     k_cache_ptr,
     v_cache_ptr,
+    k_scale_ptr,
+    v_scale_ptr,
     block_tables_ptr,
     context_lens_ptr,
     scale: tl.constexpr,
@@ -312,7 +397,7 @@ def paged_attention_decode_kernel(
     # Load query: (batch_size, num_heads, head_dim)
     offs_d = tl.arange(0, head_dim)
     q_offset = batch_idx * num_heads * head_dim + head_idx * head_dim + offs_d
-    q = tl.load(query_ptr + q_offset)
+    q = tl.load(query_ptr + q_offset).to(tl.float32)
     
     # Initialize accumulators
     acc = tl.zeros([head_dim], dtype=tl.float32)
@@ -350,13 +435,16 @@ def paged_attention_decode_kernel(
                         physical_block_idx = tl.load(block_tables_ptr + block_table_offset)
                         
                         if physical_block_idx != -1:
-                            # Load K
                             k_offset = (physical_block_idx * block_size * num_kv_heads * head_dim +
                                        block_offset * num_kv_heads * head_dim +
                                        kv_head_idx * head_dim + offs_d)
-                            k_vec = tl.load(k_cache_ptr + k_offset)
-                            
-                            # Compute score for this token
+                            scale_offset = (physical_block_idx * block_size * num_kv_heads +
+                                            block_offset * num_kv_heads +
+                                            kv_head_idx)
+                            k_raw = tl.load(k_cache_ptr + k_offset)
+                            k_s = tl.load(k_scale_ptr + scale_offset)
+                            k_vec = k_raw.to(tl.float32) * k_s
+
                             score = tl.sum(q * k_vec) * scale
                             
                             # Update qk array at position i using tl.where
@@ -389,16 +477,19 @@ def paged_attention_decode_kernel(
                         physical_block_idx = tl.load(block_tables_ptr + block_table_offset)
                         
                         if physical_block_idx != -1:
-                            # Load V
                             v_offset = (physical_block_idx * block_size * num_kv_heads * head_dim +
                                        block_offset * num_kv_heads * head_dim +
                                        kv_head_idx * head_dim + offs_d)
-                            v_vec = tl.load(v_cache_ptr + v_offset)
-                            
-                            # Extract weight for this token from p
+                            scale_offset = (physical_block_idx * block_size * num_kv_heads +
+                                            block_offset * num_kv_heads +
+                                            kv_head_idx)
+                            v_raw = tl.load(v_cache_ptr + v_offset)
+                            v_s = tl.load(v_scale_ptr + scale_offset)
+                            v_vec = v_raw.to(tl.float32) * v_s
+
                             mask_i = tl.arange(0, BLOCK_N) == i
                             weight = tl.sum(tl.where(mask_i, p, 0.0))
-                            
+
                             acc = acc + weight * v_vec
                             l_i = l_i + weight
             
@@ -416,6 +507,8 @@ def paged_attention_decode(
     query: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
+    k_scale: torch.Tensor,
+    v_scale: torch.Tensor,
     block_tables: torch.Tensor,
     context_lens: torch.Tensor,
     scale: float,
@@ -426,17 +519,8 @@ def paged_attention_decode(
 ) -> torch.Tensor:
     """
     Compute attention in decode mode using paged KV cache.
-    
-    Args:
-        query: (batch_size, num_heads, head_dim)
-        k_cache: (num_blocks, block_size, num_kv_heads, head_dim)
-        v_cache: (num_blocks, block_size, num_kv_heads, head_dim)
-        block_tables: (batch_size, max_num_blocks)
-        context_lens: (batch_size,)
-        scale: attention scale factor
-    
-    Returns:
-        output: (batch_size, num_heads, head_dim)
+
+    K/V are restored via: cache.to(fp32) * scale (scale=1.0 for fp16 mode).
     """
     batch_size = query.shape[0]
     max_num_blocks = block_tables.shape[1]
@@ -456,6 +540,8 @@ def paged_attention_decode(
         query,
         k_cache,
         v_cache,
+        k_scale,
+        v_scale,
         block_tables,
         context_lens,
         scale=scale,
@@ -485,26 +571,37 @@ class Attention(nn.Module):
         self.scale = scale
         self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
         self.block_size = block_size
+        self.kv_cache_dtype = "fp16"
         self.k_cache = self.v_cache = torch.tensor([])
+        # Always present; initialized to 1.0 in allocate_kv_cache (INT8 overwrites on store).
+        self.k_scale = self.v_scale = torch.tensor([])
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
+        k_scale, v_scale = self.k_scale, self.v_scale
 
         # Store current k, v into cache if cache is allocated
         if k_cache.numel() > 0 and v_cache.numel() > 0 and context.slot_mapping is not None:
-            # Ensure k, v are in the right shape: (num_tokens, num_kv_heads, head_dim)
             if k.dim() == 4:
-                # Batched: (B, N, num_kv_heads, head_dim) -> reshape to (B*N, num_kv_heads, head_dim)
                 B, N, num_kv_heads, head_dim = k.shape
                 k_to_store = k.reshape(B * N, num_kv_heads, head_dim).contiguous()
                 v_to_store = v.reshape(B * N, num_kv_heads, head_dim).contiguous()
             else:
-                # Already in correct shape (num_tokens, num_kv_heads, head_dim)
                 k_to_store = k.contiguous()
                 v_to_store = v.contiguous()
-            
-            store_kvcache(k_to_store, v_to_store, k_cache, v_cache, context.slot_mapping, self.block_size)
+
+            store_kvcache(
+                k_to_store,
+                v_to_store,
+                k_cache,
+                v_cache,
+                context.slot_mapping,
+                self.block_size,
+                k_scale_cache=k_scale,
+                v_scale_cache=v_scale,
+                kv_cache_dtype=self.kv_cache_dtype,
+            )
 
         scale = self.scale / (self.head_dim ** 0.5)
 
@@ -521,16 +618,18 @@ class Attention(nn.Module):
             return o.reshape(o.shape[0], self.num_heads * self.head_dim)
         else:
             o = paged_attention_decode(
-                q, 
-                k_cache, 
+                q,
+                k_cache,
                 v_cache,
+                k_scale,
+                v_scale,
                 context.block_tables,
                 context.context_lens,
                 scale,
                 self.num_heads,
                 self.num_kv_heads,
                 self.head_dim,
-                self.block_size
+                self.block_size,
             )
             # o: (batch_size, num_heads, head_dim) -> (batch_size, num_heads * head_dim)
             return o.reshape(o.shape[0], self.num_heads * self.head_dim)

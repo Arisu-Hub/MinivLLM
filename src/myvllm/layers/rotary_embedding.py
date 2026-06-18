@@ -64,10 +64,12 @@ class RotaryEmbedding(nn.Module):
         self.rotary_embedding = rotary_embedding
         # max position that the long context can reach
         self.max_position = max_position
+        # θ_i = base^(-2i/d)
         self.inv_freq = 1/(base ** (torch.arange(0, self.rotary_embedding, 2)/self.rotary_embedding))
 
         if is_llama3:
             # specifically for llama3.2
+            # 频率缩放
             import math
             inv_freq = self.inv_freq
             # no smooth if low_freq_factor == high_freq_factor
