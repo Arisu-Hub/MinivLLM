@@ -189,8 +189,13 @@ class ModelRunner:
         torch.cuda.reset_peak_memory_stats()
         max_tokens = self.config['max_num_batch_tokens']
         max_model_length = self.config['max_model_length']
-        batch_size = max_tokens // max_model_length
-        seqs = [Sequence(token_ids=[0]*max_model_length, block_size=self.config['block_size']) for _ in range(batch_size)]
+        warmup_cap = self.config.get('warmup_max_tokens', max_tokens)
+        warmup_seq_len = min(max_model_length, warmup_cap)
+        batch_size = max(1, max_tokens // warmup_seq_len)
+        seqs = [
+            Sequence(token_ids=[0] * warmup_seq_len, block_size=self.config['block_size'])
+            for _ in range(batch_size)
+        ]
         self.run(seqs, is_prefill=True)
         torch.cuda.empty_cache()
 
@@ -220,8 +225,18 @@ class ModelRunner:
             head_dim,
             kv_cache_dtype,
         )
-        num_available_kv_blocks = int(available_mem // per_block_bytes)
-        assert num_available_kv_blocks >= 1, f'Not enough memory to hold at least one block of KV cache on rank {self.rank}'
+
+        fixed_blocks = self.config.get("fixed_max_cached_blocks")
+        if fixed_blocks is not None:
+            num_available_kv_blocks = int(fixed_blocks)
+            assert num_available_kv_blocks >= 1, (
+                f"fixed_max_cached_blocks must be >= 1, got {fixed_blocks}"
+            )
+        else:
+            num_available_kv_blocks = int(available_mem // per_block_bytes)
+            assert num_available_kv_blocks >= 1, (
+                f"Not enough memory to hold at least one block of KV cache on rank {self.rank}"
+            )
         
         # Synchronize max_cached_blocks across all ranks.
         # Each rank independently computed num_available_kv_blocks from its own
@@ -248,7 +263,10 @@ class ModelRunner:
             # Single GPU: no cross-rank sync needed; use the local value directly.
             self.config['max_cached_blocks'] = num_available_kv_blocks
         if self.rank == 0:
-            print(f"[Rank 0] Global max_cached_blocks (min): {self.config['max_cached_blocks']}")
+            if fixed_blocks is not None:
+                print(f"[Rank 0] Fixed max_cached_blocks: {self.config['max_cached_blocks']}")
+            else:
+                print(f"[Rank 0] Global max_cached_blocks (min): {self.config['max_cached_blocks']}")
 
         max_cached_blocks = self.config['max_cached_blocks']
 

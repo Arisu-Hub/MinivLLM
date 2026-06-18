@@ -100,3 +100,21 @@ def kv_cache_pool_bytes(
     return max_cached_blocks * block_bytes(
         block_size, num_layers, num_kv_heads, head_dim, kv_cache_dtype
     )
+
+
+def kv_bytes_per_token(
+    num_layers: int,
+    num_kv_heads: int,
+    head_dim: int,
+    kv_cache_dtype: str = "fp16",
+) -> float:
+    """KV cache bytes per generated token (K + V data + scales)."""
+    elem_bytes = kv_cache_dtype_bytes(kv_cache_dtype)
+    data_bytes = 2 * num_layers * num_kv_heads * head_dim * elem_bytes
+    scale_bytes = 2 * num_layers * num_kv_heads * 4
+    return data_bytes + scale_bytes
+
+
+def token_capacity_for_blocks(max_cached_blocks: int, block_size: int) -> int:
+    """Max tokens storable when all blocks are available to one sequence."""
+    return max_cached_blocks * block_size
